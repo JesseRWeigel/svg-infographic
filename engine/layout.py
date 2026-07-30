@@ -26,6 +26,7 @@ both from the emitted SVG using a different font parser.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from .errors import SpecError, TextDoesNotFit, Unsatisfiable
@@ -62,6 +63,18 @@ def _r2(v: float) -> float:
     return round(v, 2) + 0.0
 
 
+def _ceil2(v: float) -> float:
+    """Round a *measurement* up to the emit precision.
+
+    Positions round to nearest, but anything the layout commits to as "at least this wide" or
+    "at least this tall" rounds away from zero. Rounding a text width down by even 0.005px
+    would let the true glyph advance sit a hair outside the container the solver sized from
+    it, and the independent checker measures the true advance. Round up and the container is
+    never smaller than what it has to hold.
+    """
+    return math.ceil(round(v, 6) * 100.0) / 100.0 + 0.0
+
+
 @dataclass(frozen=True)
 class LineMetrics:
     ascent: float
@@ -74,8 +87,8 @@ class LineMetrics:
 
 
 def metrics_for(font: Font, size: float) -> LineMetrics:
-    a = _r2(font.ascent_px(size))
-    d = _r2(font.descent_px(size))
+    a = _ceil2(font.ascent_px(size))
+    d = _ceil2(font.descent_px(size))
     lh = _r2(max(size * LINE_RATIO, a + d + MIN_LEADING))
     return LineMetrics(a, d, lh)
 
@@ -216,15 +229,15 @@ def min_width(font: Font, text: str, size: float, overflow: str) -> float:
     constraint able to fail rather than being a restatement of an already-fitted width.
     """
     if overflow == "strict":
-        return _r2(font.measure(text, size))
+        return _ceil2(font.measure(text, size))
     if overflow == "ellipsis":
-        full = _r2(font.measure(text, size))
+        full = _ceil2(font.measure(text, size))
         ell = _ellipsis_for(font)
         if ell is None:
             return full
-        return min(full, _r2(font.measure(ell, size)))
+        return min(full, _ceil2(font.measure(ell, size)))
     widths = [font.measure(ch, size) for ch in text if ch not in (" ", "\t", "\n")]
-    return _r2(max(widths)) if widths else 0.0
+    return _ceil2(max(widths)) if widths else 0.0
 
 
 def _ellipsis_for(font: Font) -> str | None:
@@ -466,7 +479,7 @@ class _Builder:
                     font=font.name,
                     anchor=anchor,
                     role=role,
-                    width=_r2(font.measure(ln, size)),
+                    width=_ceil2(font.measure(ln, size)),
                     ascent=lm.ascent,
                     descent=lm.descent,
                     fit=None if fit is None else (_r2(fit[0]), _r2(fit[1])),
@@ -542,7 +555,9 @@ def layout(doc: Doc) -> Layout:
     hdr = "box_header"
     b.box(hdr, DOC_PAD, cw, f"{hdr}:top", role="frame")
     ys.exactly("doc:top", f"{hdr}:top", DOC_PAD, f"header starts {DOC_PAD}px below the canvas top")
-    title_lines = break_lines(font, doc.title, doc.title_size, cw, "wrap", hdr)
+    # Broken with the same face it is rendered in. Measuring the regular face and drawing the
+    # bold one overflows by up to 12 percent, which is how this line came to be a comment.
+    title_lines = break_lines(bold, doc.title, doc.title_size, cw, "wrap", hdr)
     last, desc = b.place_lines(hdr, title_lines, bold, doc.title_size, "start", DOC_PAD, "title", f"{hdr}:top", 0.0)
     ys.exactly(last, f"{hdr}:bot", desc, "header frame ends at the title's last descender")
     prev_bot = f"{hdr}:bot"
@@ -666,11 +681,11 @@ def _emit_bars(b: _Builder, doc: Doc, bi: int, blk: BarChart, top: str) -> str:
 
     peak = max(x.value for x in blk.bars)
     value_strs = [_format_value(x.value, blk.unit) for x in blk.bars]
-    value_w = _r2(max(font.measure(s, blk.size) for s in value_strs))
+    value_w = _ceil2(max(font.measure(s, blk.size) for s in value_strs))
 
     label_cap = _r2(inner * LABEL_COL_MAX)
     label_lines = [break_lines(font, x.label, blk.size, label_cap, blk.label_overflow, bid) for x in blk.bars]
-    label_w = _r2(max((font.measure(ln, blk.size) for lns in label_lines for ln in lns), default=0.0))
+    label_w = _ceil2(max((font.measure(ln, blk.size) for lns in label_lines for ln in lns), default=0.0))
 
     cl, lab_r, bar_l, bar_r, val_l, cr = _solve_bar_columns(doc, label_w, value_w, tag)
     track = _r2(bar_r - bar_l)
@@ -733,7 +748,7 @@ def _emit_kpis(b: _Builder, doc: Doc, bi: int, blk: KpiRow, top: str) -> str:
             min_width(font, c.label, blk.label_size, "wrap"),
             min_width(font, c.note, note_size, "wrap") if c.note else 0.0,
         )
-        mins.append(_r2(need + 2 * CARD_PAD))
+        mins.append(_ceil2(need + 2 * CARD_PAD))
 
     lefts, share = _solve_card_columns(doc, n, mins, tag)
 

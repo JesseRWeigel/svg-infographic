@@ -63,7 +63,11 @@ class Bar:
         if not isinstance(self.value, (int, float)) or isinstance(self.value, bool):
             raise SpecError("Bar.value must be a number")
         if self.value < 0:
-            raise SpecError(f"Bar.value must be >= 0, got {self.value}")
+            raise SpecError(
+                f"Bar.value must be >= 0, got {self.value}. Bar length is a fraction of the "
+                f"largest value in the chart, which is not defined for a negative one. "
+                f"Use a diverging chart type or shift the data."
+            )
 
 
 @dataclass(frozen=True)
@@ -85,7 +89,10 @@ class BarChart:
         _check_text(self.unit, "BarChart.unit")
         _check_overflow(self.label_overflow)
         if not self.bars:
-            raise SpecError("BarChart.bars must not be empty")
+            raise SpecError(
+                "BarChart.bars must not be empty. A chart with no rows has no scale, so the "
+                "engine cannot assign bar lengths."
+            )
         if len(self.bars) > 40:
             raise SpecError(f"BarChart supports at most 40 bars, got {len(self.bars)}")
         if not 4.0 <= self.size <= 48.0:
@@ -114,7 +121,10 @@ class KpiRow:
 
     def __post_init__(self) -> None:
         if not self.cards:
-            raise SpecError("KpiRow.cards must not be empty")
+            raise SpecError(
+                "KpiRow.cards must not be empty. The row width is split between its cards, "
+                "which is undefined for zero cards."
+            )
         if len(self.cards) > 8:
             raise SpecError(f"KpiRow supports at most 8 cards, got {len(self.cards)}")
         if not 6.0 <= self.value_size <= 72.0:
@@ -134,7 +144,10 @@ class Steps:
     def __post_init__(self) -> None:
         _check_text(self.caption, "Steps.caption")
         if not self.items:
-            raise SpecError("Steps.items must not be empty")
+            raise SpecError(
+                "Steps.items must not be empty. A numbered flow with no steps has nothing to "
+                "number."
+            )
         for i, it in enumerate(self.items):
             _check_text(it, f"Steps.items[{i}]")
         if not 4.0 <= self.size <= 48.0:
@@ -181,7 +194,11 @@ class Doc:
         if not 160.0 <= self.width <= 4000.0:
             raise SpecError(f"Doc.width must be in [160, 4000], got {self.width}")
         if not self.blocks:
-            raise SpecError("Doc.blocks must not be empty")
+            raise SpecError(
+                "Doc.blocks must not be empty. An infographic with a title and nothing else "
+                "has no content to lay out, so the engine refuses rather than emitting a "
+                "canvas that only contains its own heading."
+            )
         if not 8.0 <= self.title_size <= 96.0:
             raise SpecError("Doc.title_size must be in [8, 96]")
         if not isinstance(self.accent, int) or not 0 <= self.accent <= 4:
