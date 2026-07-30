@@ -33,7 +33,7 @@ const path = require("path");
 
 const ROOT = path.resolve(__dirname, "..");
 const DOCS = path.join(ROOT, "docs");
-const PW = path.join(ROOT, "..", "a11y-sweep", "node_modules", "playwright-core");
+const PW = process.env.PLAYWRIGHT_CORE || path.join(ROOT, "..", "a11y-sweep", "node_modules", "playwright-core");
 const TITLE = "svg-infographic: a layout engine that measures its own text";
 const MARKER = "data-engine=\"svg-infographic\"";
 

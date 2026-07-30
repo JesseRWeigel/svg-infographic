@@ -286,11 +286,17 @@ def load(path: str | Path) -> Doc:
 
 # ---- claim 1: nothing overflows ---------------------------------------------
 
-# Tolerance for the comparison. The engine rounds every emitted coordinate to 0.01px, and a
-# container edge and a text edge can therefore each move by half of that. 0.02px is the
-# smallest slack that does not produce false positives from rounding alone, and it is three
-# orders of magnitude smaller than any real overflow.
-TOL = 0.02
+# Tolerance for the comparison, and it is deliberately far below the emit precision.
+#
+# An earlier version allowed 0.02px, on the reasoning that a container edge and a text edge each
+# round to the 0.01px grid. scripts/attack_verify.sh proved that wrong: inverting one rounding
+# function so measured widths round *down* instead of up produced containers a hair narrower
+# than their content, and 0.02px of slack swallowed it whole. Verify passed on a broken engine.
+#
+# The correct tolerance is float noise and nothing more. Every constraint weight sits on the
+# 0.01px grid, so every solved coordinate does too, and measured widths round away from zero.
+# A genuine overflow of half the emit precision is still an overflow.
+TOL = 0.001
 
 
 @dataclass
@@ -355,7 +361,9 @@ def worst_margin(doc: Doc) -> tuple[float, str]:
             if m < worst:
                 worst = m
                 where = f"{doc.id}/{t.id} {t.role} {name} {t.content[:34]!r}"
-    return worst, where
+    # Snap double noise to zero. A container sized to exactly its content gives a margin of 0,
+    # and -2e-15 printed as "-0.0000" would read as an overflow that is not there.
+    return (0.0 if abs(worst) < 1e-9 else worst), where
 
 
 def worst_trailing_margin(doc: Doc) -> tuple[float, str]:
@@ -376,7 +384,35 @@ def worst_trailing_margin(doc: Doc) -> tuple[float, str]:
             if m < worst:
                 worst = m
                 where = f"{doc.id}/{t.id} {t.role} {name} {t.content[:34]!r}"
-    return worst, where
+    # Snap double noise to zero. A container sized to exactly its content gives a margin of 0,
+    # and -2e-15 printed as "-0.0000" would read as an overflow that is not there.
+    return (0.0 if abs(worst) < 1e-9 else worst), where
+
+
+def margin_histogram(doc: Doc) -> tuple[int, int, float]:
+    """(edges outside, edges exactly flush, smallest strictly positive clearance).
+
+    A worst-case margin of zero is the expected result here, because the solver sizes a
+    container to exactly the content it measured. Splitting the edges out says how many are
+    flush by construction and how much room the rest have, which a single minimum cannot.
+    """
+    outside = 0
+    flush = 0
+    smallest_positive = float("inf")
+    for t in doc.texts:
+        if t.box not in doc.boxes:
+            continue
+        b = doc.boxes[t.box]
+        left = max(b.cx, t.fit_x0)
+        right = min(b.cx + b.cw, t.fit_x1)
+        for m in (t.x0 - left, right - t.x1, t.y0 - b.cy, (b.cy + b.ch) - t.y1):
+            if m < -1e-9:
+                outside += 1
+            elif m < 1e-9:
+                flush += 1
+            elif m < smallest_positive:
+                smallest_positive = m
+    return outside, flush, smallest_positive
 
 
 def metric_disagreements(doc: Doc, tol: float = 0.011) -> list[str]:
