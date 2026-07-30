@@ -12,8 +12,18 @@ This module parses TrueType/OpenType directly with ``struct``. It reads:
   hhea  numberOfHMetrics, how many entries the hmtx table actually stores
   hmtx  per-glyph advance width in font units
   cmap  codepoint to glyph id, subtable formats 4 and 12
-  OS/2  typographic ascender/descender/lineGap, for line height
+  OS/2  typographic and windows ascender/descender, for the line box
+  loca  where each glyph's outline starts
+  glyf  each glyph's own bounding box, for ink extents
   name  the family name, so the emitted SVG can name the font it was measured against
+
+Vertical extents deserve a note, because a browser measurement forced this design. A renderer's
+``getBBox()`` on a text element reports a *line box*, not the ink and not the typographic em
+box. Chromium's is roughly 0.88em above the baseline and 0.29em below for DejaVu Sans, grows for
+glyphs whose outlines exceed that, and is rounded outward to whole pixels. Reserving only the
+OS/2 typographic ascender and descender therefore leaves glyphs measurably outside their
+containers. So the reserved extent here is the union of every vertical metric the font declares,
+the ink of the glyphs actually being set, and a one-pixel allowance for the renderer's rounding.
 
 Advance width is the correct quantity. It is how far the pen moves after drawing a glyph,
 which is what determines the length of a run of text. Bounding-box width (xMax - xMin from
@@ -22,12 +32,11 @@ underestimates, and for a space glyph it is zero.
 
 What this deliberately does not do:
 
-  Kerning. DejaVu Sans carries both a legacy ``kern`` table and GPOS kern pairs, and a
-  browser applies them by default. Rather than reimplement GPOS, the renderer emits
-  ``font-kerning="none"`` and ``font-variant-ligatures="none"`` on every text element so
-  that the rendered advance is exactly the sum of hmtx advances. tests/test_fontmetrics.py
-  checks that assumption against a real browser, so if it were wrong the suite would fail
-  rather than the guarantee quietly weakening.
+  Kerning. DejaVu Sans carries both a legacy ``kern`` table and GPOS kern pairs. Rather than
+  reimplement GPOS, the renderer switches kerning and ligatures off in CSS so the rendered
+  advance is exactly the sum of hmtx advances. tools/browser_check.js compares the two on
+  every text element of the published page, so if the assumption were wrong the check would
+  fail rather than the guarantee quietly weakening.
 
   Bidi and complex shaping. Arabic, Devanagari and friends need a shaping engine. Any
   codepoint whose script needs reordering or contextual forms is out of scope, and the
@@ -231,6 +240,45 @@ def _parse_cmap(data: bytes, off: int) -> dict[int, int]:
     return merged
 
 
+def _parse_ink(
+    data: bytes, tables: dict[str, tuple[int, int]], num_glyphs: int, head_off: int
+) -> tuple[tuple[int, int, int, int], ...]:
+    """Per-glyph (yMin, yMax, xMin, xMax) from the glyf table.
+
+    Every glyph description, simple or composite, starts with a header of numberOfContours
+    followed by xMin, yMin, xMax, yMax, so a composite needs no recursion: its own header
+    already carries the union of its components. A zero-length loca entry means an empty glyph
+    such as the space, which has no ink.
+    """
+    if "glyf" not in tables or "loca" not in tables:
+        return ()
+    index_to_loc = _s16(data, head_off + 50)
+    loca_off, loca_len = tables["loca"]
+    glyf_off = tables["glyf"][0]
+    out: list[tuple[int, int, int, int]] = []
+    for gid in range(num_glyphs):
+        if index_to_loc == 0:
+            i = loca_off + gid * 2
+            if i + 4 > loca_off + loca_len:
+                out.append((0, 0, 0, 0))
+                continue
+            start = _u16(data, i) * 2
+            end = _u16(data, i + 2) * 2
+        else:
+            i = loca_off + gid * 4
+            if i + 8 > loca_off + loca_len:
+                out.append((0, 0, 0, 0))
+                continue
+            start = _u32(data, i)
+            end = _u32(data, i + 4)
+        if end <= start or start + 10 > len(data) - glyf_off:
+            out.append((0, 0, 0, 0))
+            continue
+        g = glyf_off + start
+        out.append((_s16(data, g + 4), _s16(data, g + 8), _s16(data, g + 2), _s16(data, g + 6)))
+    return tuple(out)
+
+
 def _parse_name(data: bytes, off: int) -> str:
     count = _u16(data, off + 2)
     string_off = off + _u16(data, off + 4)
@@ -265,12 +313,19 @@ class Font:
     name: str
     path: str
     units_per_em: int
-    ascender: int
-    descender: int
+    ascender: int  # the union of hhea, OS/2 typo and OS/2 win ascenders
+    descender: int  # negative, the union of the three descenders
     line_gap: int
+    typo_ascender: int
+    typo_descender: int
     advances: tuple[int, ...]  # per glyph id, font units
     cmap: dict[int, int]
     family_from_file: str
+    # Per-glyph ink extents from the glyf table, (yMin, yMax, xMin, xMax) in font units. A
+    # renderer's getBBox() on a text element reports the ink, not the advance box, so a layout
+    # that only reserves ascender-plus-descender has glyphs poking out of its containers. The
+    # browser check found exactly that, which is why these are parsed.
+    ink: tuple[tuple[int, int, int, int], ...] = ()
 
     # ---- glyph lookup -------------------------------------------------------
 
@@ -322,6 +377,75 @@ class Font:
     def descent_px(self, size: float) -> float:
         return abs(self.descender) * size / self.units_per_em
 
+    # ---- ink extents --------------------------------------------------------
+
+    def ink_extents(self, text: str) -> tuple[int, int]:
+        """(above baseline, below baseline) in font units, over the glyphs in ``text``.
+
+        Empty glyphs such as the space have no contours and contribute nothing. Both values are
+        clamped at zero, so a string of only spaces reports no extent rather than a negative
+        one.
+        """
+        if not self.ink:
+            # No glyf table. Fall back to the font's global glyph box, which is a valid
+            # superset for any string and only ever too generous.
+            return (self.ascender, abs(self.descender))
+        up = 0
+        down = 0
+        for ch in text:
+            gid = self.cmap.get(ord(ch))
+            if gid is None or gid >= len(self.ink):
+                continue
+            y_min, y_max = self.ink[gid][0], self.ink[gid][1]
+            if y_max > up:
+                up = y_max
+            if -y_min > down:
+                down = -y_min
+        return (max(0, up), max(0, down))
+
+    def ink_overhang(self, text: str) -> tuple[int, int]:
+        """How far the painted glyphs reach outside the run's advance box, in font units.
+
+        Returns (left, right), both non-negative. Side bearings can be negative and combining
+        marks have zero advance with up to a full em of ink, so a run's ink is genuinely wider
+        than its advance. That is not overflow: every text system reserves the advance box and
+        lets the ink hang. It is reported so an outside checker measuring a renderer's bounding
+        box knows exactly how much hang to expect, instead of having to guess a tolerance.
+        """
+        if not self.ink:
+            return (0, 0)
+        pen = 0
+        left = 0
+        right = 0
+        for ch in text:
+            gid = self.cmap.get(ord(ch))
+            if gid is None or gid >= len(self.ink):
+                continue
+            _, _, x_min, x_max = self.ink[gid]
+            adv = self.advances[gid]
+            if x_min != x_max:  # an empty glyph has a degenerate box
+                if pen + x_min < -left:
+                    left = -(pen + x_min)
+                over = pen + x_max
+                if over > right:
+                    right = over
+            pen += adv
+        return (max(0, left), max(0, right - pen))
+
+    def ink_overhang_px(self, text: str, size: float) -> tuple[float, float]:
+        left, right = self.ink_overhang(text)
+        return (left * size / self.units_per_em, right * size / self.units_per_em)
+
+    def line_ascent_px(self, text: str, size: float) -> float:
+        """Space to reserve above the baseline: the typographic ascent or the ink, whichever
+        is larger."""
+        up, _ = self.ink_extents(text)
+        return max(self.ascender, up) * size / self.units_per_em
+
+    def line_descent_px(self, text: str, size: float) -> float:
+        _, down = self.ink_extents(text)
+        return max(abs(self.descender), down) * size / self.units_per_em
+
     def natural_line_height(self, size: float) -> float:
         return (
             (self.ascender + abs(self.descender) + self.line_gap)
@@ -353,16 +477,22 @@ def _load(path: Path, name: str) -> Font:
     if num_h_metrics == 0:
         raise FontError("numberOfHMetrics is zero")
 
-    ascender, descender, line_gap = hhea_ascender, hhea_descender, hhea_line_gap
+    typo_ascender, typo_descender, line_gap = hhea_ascender, hhea_descender, hhea_line_gap
+    win_ascender, win_descender = hhea_ascender, abs(hhea_descender)
     if "OS/2" in tables:
         os2_off = tables["OS/2"][0]
-        version = _u16(data, os2_off)
-        if version >= 0:
-            typo_asc = _s16(data, os2_off + 68)
-            typo_desc = _s16(data, os2_off + 70)
-            typo_gap = _s16(data, os2_off + 72)
-            if typo_asc > 0:
-                ascender, descender, line_gap = typo_asc, typo_desc, typo_gap
+        typo_asc = _s16(data, os2_off + 68)
+        typo_desc = _s16(data, os2_off + 70)
+        typo_gap = _s16(data, os2_off + 72)
+        if typo_asc > 0:
+            typo_ascender, typo_descender, line_gap = typo_asc, typo_desc, typo_gap
+        win_ascender = _u16(data, os2_off + 74)
+        win_descender = _u16(data, os2_off + 76)
+
+    # The union, because a renderer may use any of them and the reserved space has to cover
+    # whichever it picks.
+    ascender = max(hhea_ascender, typo_ascender, win_ascender)
+    descender = -max(abs(hhea_descender), abs(typo_descender), win_descender)
 
     # hmtx stores numberOfHMetrics (advance, lsb) pairs, then monospaced tail glyphs that
     # all reuse the last advance. Missing that tail rule is the classic hmtx bug.
@@ -378,6 +508,7 @@ def _load(path: Path, name: str) -> Font:
 
     cmap = _parse_cmap(data, tables["cmap"][0])
     family = _parse_name(data, tables["name"][0]) if "name" in tables else ""
+    ink = _parse_ink(data, tables, num_glyphs, head_off)
 
     return Font(
         name=name,
@@ -386,9 +517,12 @@ def _load(path: Path, name: str) -> Font:
         ascender=ascender,
         descender=descender,
         line_gap=line_gap,
+        typo_ascender=typo_ascender,
+        typo_descender=typo_descender,
         advances=tuple(advances),
         cmap=cmap,
         family_from_file=family,
+        ink=ink,
     )
 
 

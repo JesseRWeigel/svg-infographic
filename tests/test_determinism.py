@@ -66,7 +66,11 @@ class TestDeterminism(unittest.TestCase):
         print(f"    {len(seen)} corpus specs produced {len(seen)} distinct outputs")
 
     def test_a_one_field_change_changes_the_output(self):
-        base = CORPUS[0]
+        # The base has to contain every block type, because a field can be legitimately
+        # invisible in a document that has nothing it applies to. Changing ``accent`` on a spec
+        # with no bars and no step badges really does produce identical bytes, and that is
+        # correct rather than a determinism bug.
+        base = next(s for s in CORPUS if s.id == "c29-mixed-light")
         variants = [
             replace(base, title=base.title + "."),
             replace(base, width=base.width + 1),

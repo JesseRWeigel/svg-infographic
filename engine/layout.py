@@ -49,8 +49,29 @@ MIN_BAR = 28.0
 BAR_H_RATIO = 0.92
 LABEL_COL_MAX = 0.42
 LINE_RATIO = 1.42
-MIN_LEADING = 2.0
+MIN_LEADING = 1.0
+
+# Px added to the reserved ascent and descent of every line.
+#
+# Also forced by a browser measurement. Chromium rounds the line box it reports from
+# getBBox() outward to whole pixels, so a container sized to the exact scaled metric came out
+# 0.005px short for an accented line and 0.4px short for Han. One pixel covers the rounding
+# with room over, and because it lands inside the leading the reserved box grows without the
+# line spacing changing at body sizes.
+VERT_SLACK = 1.0
 ELLIPSIS = "…"
+
+# Px of headroom reserved per text run for the renderer's own subpixel quantization.
+#
+# This constant exists because of something the browser check found. Chromium's default
+# text-rendering rounds every glyph advance to a whole pixel, so getComputedTextLength() for a
+# 45-character line came out 12px wider than the font's fractional advance sum, and claim 1 was
+# false in the browser while true on paper. The renderer is told to stop doing that, with
+# text-rendering: geometricPrecision, which brings the two within Chromium's 1/64px subpixel
+# grid: worst disagreement measured across the whole page is under 0.01px. This reserve is
+# roughly five times that, subtracted from every container before text is broken to fit it, so
+# a renderer rounding up cannot push a line past its container edge.
+RENDER_SLACK = 0.05
 
 
 def _r2(v: float) -> float:
@@ -75,6 +96,17 @@ def _ceil2(v: float) -> float:
     return math.ceil(round(v, 6) * 100.0) / 100.0 + 0.0
 
 
+def _floor2(v: float) -> float:
+    """Round an *allowance* down to the emit precision.
+
+    The mirror of _ceil2. A share of available space that rounds up overruns the space it was
+    divided out of: three cards at 217.67px plus two 12px gaps is 677.01px inside a 677px row,
+    which the solver correctly refuses. Rounding the share down leaves at most 0.03px of the
+    row unused and always fits.
+    """
+    return math.floor(round(v, 6) * 100.0) / 100.0 + 0.0
+
+
 @dataclass(frozen=True)
 class LineMetrics:
     ascent: float
@@ -86,9 +118,16 @@ class LineMetrics:
         return _r2(self.ascent + self.descent)
 
 
-def metrics_for(font: Font, size: float) -> LineMetrics:
-    a = _ceil2(font.ascent_px(size))
-    d = _ceil2(font.descent_px(size))
+def metrics_for(font: Font, size: float, lines: list[str] | tuple[str, ...]) -> LineMetrics:
+    """Reserved vertical extent for a stack of lines, and the spacing between them.
+
+    One ascent and one descent for the whole stack, taken as the maximum over its lines, so the
+    baseline rhythm stays even. Per-line values would make the spacing jog wherever a line
+    happens to contain a tall accent.
+    """
+    joined = "".join(lines)
+    a = _ceil2(font.line_ascent_px(joined, size)) + VERT_SLACK
+    d = _ceil2(font.line_descent_px(joined, size)) + VERT_SLACK
     lh = _r2(max(size * LINE_RATIO, a + d + MIN_LEADING))
     return LineMetrics(a, d, lh)
 
@@ -170,6 +209,9 @@ def break_lines(
     The result is re-measured before it leaves this function. A line that still exceeds
     ``avail`` raises, because emitting it would silently break claim 1.
     """
+    # Every caller's container is shrunk by the renderer reserve here, in one place, so no
+    # call site can forget it.
+    avail = _r2(avail - RENDER_SLACK)
     if avail <= 0:
         raise TextDoesNotFit(text, font.measure(text, size), avail, box)
 
@@ -323,6 +365,12 @@ class TextRun:
     # about this interval, so it is emitted into the SVG for an outside checker to read.
     fit_x0: float = 0.0
     fit_x1: float = 0.0
+    # How far the painted glyphs reach outside the advance box, from the font's own side
+    # bearings. Not overflow: every text system reserves the advance box and lets ink hang.
+    # Declared so a checker measuring a renderer's bounding box knows exactly how much to
+    # expect rather than having to invent a tolerance.
+    ink_left: float = 0.0
+    ink_right: float = 0.0
 
     @property
     def x0(self) -> float:
@@ -385,7 +433,7 @@ def _content_width(doc: Doc) -> float:
 
 
 def _card_share(doc: Doc, n: int) -> float:
-    return _r2((_content_width(doc) - (n - 1) * CARD_GAP) / n)
+    return _floor2((_content_width(doc) - (n - 1) * CARD_GAP) / n)
 
 
 def _format_value(v: float, unit: str) -> str:
@@ -447,7 +495,7 @@ class _Builder:
         One SVG element per line, never a tspan, so a browser can measure each line on its
         own and the overflow check has one number per element to compare.
         """
-        lm = metrics_for(font, size)
+        lm = metrics_for(font, size, lines)
         prev = ""
         for i, ln in enumerate(lines):
             bv = f"{box_id}:{role}:{i}:base"
@@ -483,6 +531,7 @@ class _Builder:
                     ascent=lm.ascent,
                     descent=lm.descent,
                     fit=None if fit is None else (_r2(fit[0]), _r2(fit[1])),
+                    ink=tuple(_ceil2(v) for v in font.ink_overhang_px(ln, size)),
                 )
             )
             prev = bv
@@ -624,6 +673,8 @@ def layout(doc: Doc) -> Layout:
                 descent=t["descent"],
                 fit_x0=fit[0],
                 fit_x1=fit[1],
+                ink_left=t["ink"][0],
+                ink_right=t["ink"][1],
             )
         )
     texts = tuple(texts_list)
@@ -681,15 +732,17 @@ def _emit_bars(b: _Builder, doc: Doc, bi: int, blk: BarChart, top: str) -> str:
 
     peak = max(x.value for x in blk.bars)
     value_strs = [_format_value(x.value, blk.unit) for x in blk.bars]
-    value_w = _ceil2(max(font.measure(s, blk.size) for s in value_strs))
+    value_w = _ceil2(max(font.measure(s, blk.size) for s in value_strs) + RENDER_SLACK)
 
     label_cap = _r2(inner * LABEL_COL_MAX)
     label_lines = [break_lines(font, x.label, blk.size, label_cap, blk.label_overflow, bid) for x in blk.bars]
-    label_w = _ceil2(max((font.measure(ln, blk.size) for lns in label_lines for ln in lns), default=0.0))
+    label_w = _ceil2(max((font.measure(ln, blk.size) for lns in label_lines for ln in lns), default=0.0) + RENDER_SLACK)
 
     cl, lab_r, bar_l, bar_r, val_l, cr = _solve_bar_columns(doc, label_w, value_w, tag)
     track = _r2(bar_r - bar_l)
-    lm = metrics_for(font, blk.size)
+    # One row metric for the whole chart, over every label line and every value, so all rows
+    # are the same height and the bars line up.
+    lm = metrics_for(font, blk.size, [ln for lns in label_lines for ln in lns] + value_strs)
 
     b.box(bid, DOC_PAD, panel_w, f"{bid}:top", PANEL_PAD, PANEL_PAD, "panel")
     ys.exactly(top, f"{bid}:top", 0.0, f"{tag} panel top is the block top")
@@ -722,7 +775,7 @@ def _emit_bars(b: _Builder, doc: Doc, bi: int, blk: BarChart, top: str) -> str:
         dy = _r2((lm.em_box - bar_h) / 2.0)
         b.shapes.append(("rect", bar_l, rtop, dy, track, bar_h, "track", 0, _r2(bar_h / 2)))
         frac = 0.0 if peak <= 0 else bar.value / peak
-        b.shapes.append(("rect", bar_l, rtop, dy, _r2(max(2.0, track * frac)), bar_h, "bar", doc.accent, _r2(bar_h / 2)))
+        b.shapes.append(("rect", bar_l, rtop, dy, _floor2(min(track, max(2.0, track * frac))), bar_h, "bar", doc.accent, _r2(bar_h / 2)))
 
         nlines = max(len(lines), 1)
         span = _r2(lm.line_height * nlines)
@@ -748,7 +801,7 @@ def _emit_kpis(b: _Builder, doc: Doc, bi: int, blk: KpiRow, top: str) -> str:
             min_width(font, c.label, blk.label_size, "wrap"),
             min_width(font, c.note, note_size, "wrap") if c.note else 0.0,
         )
-        mins.append(_ceil2(need + 2 * CARD_PAD))
+        mins.append(_ceil2(need + RENDER_SLACK + 2 * CARD_PAD))
 
     lefts, share = _solve_card_columns(doc, n, mins, tag)
 
@@ -829,8 +882,8 @@ def _emit_steps(b: _Builder, doc: Doc, bi: int, blk: Steps, top: str) -> str:
         ys.exactly(last, cursor, _r2(desc + 10.0), f"{tag} first step starts 10px below the caption's descender")
         first_gap = 0.0
 
-    lm = metrics_for(font, blk.size)
-    nm = metrics_for(bold, blk.size)
+    lm = metrics_for(font, blk.size, list(blk.items))
+    nm = metrics_for(bold, blk.size, [str(i + 1) for i in range(len(blk.items))])
     prev = cursor
     for si, item in enumerate(blk.items):
         sid = f"{bid}i{si}"

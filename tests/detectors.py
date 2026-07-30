@@ -10,7 +10,11 @@ What it derives, and from what:
   text width        fontTools hmtx advances summed over the string, scaled by unitsPerEm.
                     Compared against the engine's own ``data-measured`` attribute, so a
                     disagreement between the two parsers is itself a failure.
-  em box height     fontTools OS/2 sTypoAscender / sTypoDescender, hhea if OS/2 is absent.
+  line box height   the union of the font's hhea, OS/2 typographic and OS/2 windows vertical
+                    metrics, the ink extents of the glyphs in the run taken from fontTools'
+                    glyf bounds, and the engine's one-pixel renderer allowance. That definition
+                    is shared with the engine on purpose, because it is a design decision rather
+                    than a derivation; what is independent is every number that goes into it.
   container         the ``data-content`` rectangle on the ``<rect>`` the text names in
                     ``data-box``, intersected with the ``data-fit`` column the solver
                     assigned. Both come off the drawn geometry, so the engine cannot claim a
@@ -46,12 +50,17 @@ _FILES = {
 _CACHE: dict[tuple[str, str], "FTFont"] = {}
 
 
+VERT_SLACK = 1.0  # must match engine.layout.VERT_SLACK
+
+
 @dataclass
 class FTFont:
     upem: int
     ascent: float
     descent: float
     advances: dict[int, int]  # codepoint -> advance in font units
+    ink: dict[int, tuple[int, int]]  # codepoint -> (yMin, yMax) in font units
+    xink: dict[int, tuple[int, int]]  # codepoint -> (xMin, xMax) in font units
 
     def width(self, text: str, size: float) -> float:
         total = 0
@@ -62,11 +71,30 @@ class FTFont:
             total += a
         return total * size / self.upem
 
-    def ascent_px(self, size: float) -> float:
-        return self.ascent * size / self.upem
+    def required_ascent(self, text: str, size: float) -> float:
+        up = max([self.ink.get(ord(c), (0, 0))[1] for c in text] + [self.ascent])
+        return up * size / self.upem + VERT_SLACK
 
-    def descent_px(self, size: float) -> float:
-        return abs(self.descent) * size / self.upem
+    def required_descent(self, text: str, size: float) -> float:
+        down = max([-self.ink.get(ord(c), (0, 0))[0] for c in text] + [abs(self.descent)])
+        return down * size / self.upem + VERT_SLACK
+
+    def ink_overhang(self, text: str, size: float) -> tuple[float, float]:
+        """(left, right) px of paint outside the advance box, computed from fontTools bounds."""
+        pen = 0
+        left = 0
+        right = 0
+        for ch in text:
+            cp = ord(ch)
+            box = self.xink.get(cp)
+            adv = self.advances.get(cp, 0)
+            if box is not None and box[0] != box[1]:
+                if pen + box[0] < -left:
+                    left = -(pen + box[0])
+                if pen + box[1] > right:
+                    right = pen + box[1]
+            pen += adv
+        return (max(0, left) * size / self.upem, max(0, right - pen) * size / self.upem)
 
 
 def font_for(family: str, weight: str) -> FTFont:
@@ -80,13 +108,28 @@ def font_for(family: str, weight: str) -> FTFont:
     cmap = tt.getBestCmap()
     hmtx = tt["hmtx"]
     upem = tt["head"].unitsPerEm
-    asc, desc = tt["hhea"].ascent, tt["hhea"].descent
+    asc = tt["hhea"].ascent
+    desc = abs(tt["hhea"].descent)
     if "OS/2" in tt:
         os2 = tt["OS/2"]
         if getattr(os2, "sTypoAscender", 0) > 0:
-            asc, desc = os2.sTypoAscender, os2.sTypoDescender
+            asc = max(asc, os2.sTypoAscender)
+            desc = max(desc, abs(os2.sTypoDescender))
+        asc = max(asc, getattr(os2, "usWinAscent", 0))
+        desc = max(desc, getattr(os2, "usWinDescent", 0))
     advances = {cp: hmtx[g][0] for cp, g in cmap.items()}
-    f = FTFont(upem=upem, ascent=asc, descent=desc, advances=advances)
+    glyf = tt["glyf"] if "glyf" in tt else None
+    ink: dict[int, tuple[int, int]] = {}
+    xink: dict[int, tuple[int, int]] = {}
+    for cp, name in cmap.items():
+        if glyf is None:
+            ink[cp] = (-desc, asc)
+            xink[cp] = (0, 0)
+            continue
+        g = glyf[name]
+        ink[cp] = (getattr(g, "yMin", 0) or 0, getattr(g, "yMax", 0) or 0)
+        xink[cp] = (getattr(g, "xMin", 0) or 0, getattr(g, "xMax", 0) or 0)
+    f = FTFont(upem=upem, ascent=asc, descent=-desc, advances=advances, ink=ink, xink=xink)
     _CACHE[key] = f
     return f
 
@@ -124,6 +167,8 @@ class TextEl:
     claimed_descent: float
     fit_x0: float
     fit_x1: float
+    claimed_ink_left: float = 0.0
+    claimed_ink_right: float = 0.0
     # filled by measure()
     width: float = 0.0
     ascent: float = 0.0
@@ -149,11 +194,23 @@ class TextEl:
     def y1(self) -> float:
         return self.baseline + self.descent
 
+    # What the run genuinely needs, from this checker's own parse.
+    required_ascent: float = 0.0
+    required_descent: float = 0.0
+    ink_left: float = 0.0
+    ink_right: float = 0.0
+
     def measure(self) -> None:
         f = font_for(self.family, self.weight)
         self.width = f.width(self.content, self.size)
-        self.ascent = f.ascent_px(self.size)
-        self.descent = f.descent_px(self.size)
+        self.ink_left, self.ink_right = f.ink_overhang(self.content, self.size)
+        self.required_ascent = f.required_ascent(self.content, self.size)
+        self.required_descent = f.required_descent(self.content, self.size)
+        # Containment is checked against whichever box is larger: what the engine claims to
+        # have reserved, or what this checker says the glyphs need. If the engine under-reserved,
+        # the larger box is the checker's and the overflow shows up.
+        self.ascent = max(self.claimed_ascent, self.required_ascent)
+        self.descent = max(self.claimed_descent, self.required_descent)
 
 
 @dataclass
@@ -197,6 +254,7 @@ def parse(svg: str, source: str = "<string>") -> Doc:
             )
         elif el.tag == SVG_NS + "text":
             fit = el.get("data-fit", "0 0").split()
+            ink = el.get("data-ink", "0 0").split()
             t = TextEl(
                 id=el.get("id", ""),
                 box=el.get("data-box", ""),
@@ -213,6 +271,8 @@ def parse(svg: str, source: str = "<string>") -> Doc:
                 claimed_descent=float(el.get("data-descent", "nan")),
                 fit_x0=float(fit[0]),
                 fit_x1=float(fit[1]),
+                claimed_ink_left=float(ink[0]),
+                claimed_ink_right=float(ink[1]),
             )
             t.measure()
             texts.append(t)
@@ -320,7 +380,14 @@ def worst_trailing_margin(doc: Doc) -> tuple[float, str]:
 
 
 def metric_disagreements(doc: Doc, tol: float = 0.011) -> list[str]:
-    """Where the engine's own numbers differ from this checker's independent parse."""
+    """Where the engine's own numbers differ from this checker's independent parse.
+
+    Width has to match: the engine rounds up to 0.01px, so anything beyond that tolerance is a
+    parser disagreement. Ascent and descent only have to be *at least* what the glyphs need,
+    because the engine reserves one value for a whole stack of lines while this checker looks at
+    one line at a time. Over-reserving is checked too, loosely, so a bug that inflates the
+    reserve until everything trivially fits does not pass.
+    """
     bad = []
     for t in doc.texts:
         if abs(t.width - t.claimed_width) > tol:
@@ -328,10 +395,31 @@ def metric_disagreements(doc: Doc, tol: float = 0.011) -> list[str]:
                 f"{doc.id}/{t.id} width: engine says {t.claimed_width}, fontTools says "
                 f"{t.width:.4f} for {t.content[:40]!r} at {t.size}px {t.family} {t.weight}"
             )
-        if abs(t.ascent - t.claimed_ascent) > tol:
-            bad.append(f"{doc.id}/{t.id} ascent: engine {t.claimed_ascent}, fontTools {t.ascent:.4f}")
-        if abs(t.descent - t.claimed_descent) > tol:
-            bad.append(f"{doc.id}/{t.id} descent: engine {t.claimed_descent}, fontTools {t.descent:.4f}")
+        if t.claimed_ascent < t.required_ascent - tol:
+            bad.append(
+                f"{doc.id}/{t.id} reserved only {t.claimed_ascent} above the baseline but "
+                f"{t.content[:30]!r} at {t.size}px needs {t.required_ascent:.4f}"
+            )
+        if t.claimed_descent < t.required_descent - tol:
+            bad.append(
+                f"{doc.id}/{t.id} reserved only {t.claimed_descent} below the baseline but "
+                f"{t.content[:30]!r} at {t.size}px needs {t.required_descent:.4f}"
+            )
+        for side, claimed, actual in (
+            ("left", t.claimed_ink_left, t.ink_left),
+            ("right", t.claimed_ink_right, t.ink_right),
+        ):
+            if claimed < actual - tol or claimed > actual + 0.011:
+                bad.append(
+                    f"{doc.id}/{t.id} declares {claimed}px of {side} ink overhang but fontTools "
+                    f"computes {actual:.4f}px for {t.content[:30]!r} at {t.size}px"
+                )
+        slack = max(t.claimed_ascent - t.required_ascent, t.claimed_descent - t.required_descent)
+        if slack > 0.5 * t.size + 2.0:
+            bad.append(
+                f"{doc.id}/{t.id} reserved {slack:.2f}px more than needed at {t.size}px, which "
+                f"looks like the reserve was inflated rather than measured"
+            )
     return bad
 
 

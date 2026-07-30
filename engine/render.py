@@ -164,12 +164,19 @@ def _text_svg(t: TextRun, theme: str) -> str:
         ("font-size", fmt(t.size)),
         ("font-weight", css_weight(t.font)),
         ("text-anchor", t.anchor),
-        # Kerning and ligatures are switched off so the rendered advance is exactly the sum
-        # of hmtx advances this engine measured. Leaving them on would mean the renderer
-        # applies GPOS adjustments the measurement never saw.
-        ("font-kerning", "none"),
-        ("font-variant-ligatures", "none"),
-        ("letter-spacing", "0"),
+        # These four go in a style attribute rather than as presentation attributes, because
+        # Chromium ignores font-kerning and font-variant-ligatures when they are written as SVG
+        # attributes: computed style came back "auto" and "normal". As CSS they take effect.
+        #
+        # text-rendering: geometricPrecision is the important one. Without it Chromium hints
+        # every glyph advance to a whole pixel, so a 45-character line rendered 12px wider than
+        # the font's advance sum and text really did leave its box. With it, the rendered
+        # advance matches the measurement to within Chromium's 1/64px subpixel grid.
+        (
+            "style",
+            "text-rendering:geometricPrecision;font-kerning:none;"
+            "font-variant-ligatures:none;letter-spacing:0",
+        ),
         ("xml:space", "preserve"),
         ("fill", color),
         ("data-box", _esc_attr(t.box)),
@@ -178,6 +185,7 @@ def _text_svg(t: TextRun, theme: str) -> str:
         ("data-ascent", fmt(t.ascent)),
         ("data-descent", fmt(t.descent)),
         ("data-fit", f"{fmt(t.fit_x0)} {fmt(t.fit_x1)}"),
+        ("data-ink", f"{fmt(t.ink_left)} {fmt(t.ink_right)}"),
     ]
     return f"  <text {_attrs(pairs)}>{_esc_text(t.content)}</text>"
 
