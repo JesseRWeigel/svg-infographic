@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .errors import SpecError, TextDoesNotFit
+from .errors import SpecError, TextDoesNotFit, Unsatisfiable
 from .fontmetrics import Font, get_font
 from .solver import System
 from .spec import BarChart, Block, Doc, KpiRow, Paragraph, Steps
@@ -205,11 +205,48 @@ def _wrap_one(font: Font, text: str, size: float, avail: float) -> list[str]:
     return lines or [""]
 
 
+def min_width(font: Font, text: str, size: float, overflow: str) -> float:
+    """The narrowest container ``text`` can ever be laid out in under ``overflow``.
+
+    For ``wrap`` it is the widest single non-space character, because char-breaking can put
+    one character on a line but cannot split a character. For ``ellipsis`` it is the width of
+    the ellipsis itself. For ``strict`` it is the whole string.
+
+    This is what a column's minimum-size constraint is built from, which is what makes the
+    constraint able to fail rather than being a restatement of an already-fitted width.
+    """
+    if overflow == "strict":
+        return _r2(font.measure(text, size))
+    if overflow == "ellipsis":
+        full = _r2(font.measure(text, size))
+        ell = _ellipsis_for(font)
+        if ell is None:
+            return full
+        return min(full, _r2(font.measure(ell, size)))
+    widths = [font.measure(ch, size) for ch in text if ch not in (" ", "\t", "\n")]
+    return _r2(max(widths)) if widths else 0.0
+
+
+def _ellipsis_for(font: Font) -> str | None:
+    """The truncation marker this font can actually draw, or None if it can draw neither.
+
+    Not every font has U+2026, and a CJK fallback font may have no ASCII full stop either.
+    Returning None so the caller can refuse is better than emitting a .notdef box.
+    """
+    if font.has_char(ELLIPSIS):
+        return ELLIPSIS
+    if font.has_char("."):
+        return "..."
+    return None
+
+
 def _ellipsize(font: Font, text: str, size: float, avail: float, box: str) -> str:
     flat = text.replace("\n", " ")
     if font.measure(flat, size) <= avail:
         return flat
-    ell = ELLIPSIS if font.has_char(ELLIPSIS) else "..."
+    ell = _ellipsis_for(font)
+    if ell is None:
+        raise TextDoesNotFit(text, font.measure(flat, size), avail, box)
     ell_w = font.measure(ell, size)
     if ell_w > avail:
         raise TextDoesNotFit(text, ell_w, avail, box)
@@ -685,28 +722,30 @@ def _emit_kpis(b: _Builder, doc: Doc, bi: int, blk: KpiRow, top: str) -> str:
     ys, font, bold = b.ys, b.font, b.bold
     tag = f"kpi row {bi}"
     n = len(blk.cards)
-    share = _card_share(doc, n)
-    inner = _r2(share - 2 * CARD_PAD)
-    if inner <= 0:
-        raise TextDoesNotFit(blk.cards[0].value, _r2(2 * CARD_PAD), share, f"box_k{bi}c0")
-
     note_size = _r2(blk.label_size - 1)
-    per_card = []
+
+    # Pass one: the irreducible minimum each card needs, before any wrapping. This is what
+    # the column constraint is built from, so the constraint can genuinely fail.
     mins = []
+    for c in blk.cards:
+        need = max(
+            min_width(bold, c.value, blk.value_size, "ellipsis"),
+            min_width(font, c.label, blk.label_size, "wrap"),
+            min_width(font, c.note, note_size, "wrap") if c.note else 0.0,
+        )
+        mins.append(_r2(need + 2 * CARD_PAD))
+
+    lefts, share = _solve_card_columns(doc, n, mins, tag)
+
+    # Pass two: wrap against the width the solver actually assigned.
+    inner = _r2(share - 2 * CARD_PAD)
+    per_card = []
     for ci, c in enumerate(blk.cards):
         bidc = f"box_k{bi}c{ci}"
         vl = break_lines(bold, c.value, blk.value_size, inner, "ellipsis", bidc)
         ll = break_lines(font, c.label, blk.label_size, inner, "wrap", bidc)
         nl = break_lines(font, c.note, note_size, inner, "wrap", bidc) if c.note else []
         per_card.append((vl, ll, nl))
-        widest = max(
-            [bold.measure(s, blk.value_size) for s in vl]
-            + [font.measure(s, blk.label_size) for s in ll]
-            + [font.measure(s, note_size) for s in nl]
-        )
-        mins.append(_r2(widest + 2 * CARD_PAD))
-
-    lefts, share = _solve_card_columns(doc, n, mins, tag)
 
     rowtop = f"box_kpirow{bi}:top"
     rowbot = f"box_kpirow{bi}:bot"
@@ -753,7 +792,15 @@ def _emit_steps(b: _Builder, doc: Doc, bi: int, blk: Steps, top: str) -> str:
     text_x = _r2(DOC_PAD + PANEL_PAD + badge + COL_GAP)
     avail = _r2(doc.width - DOC_PAD - PANEL_PAD - text_x)
     if avail <= 0:
-        raise TextDoesNotFit(blk.items[0], _r2(badge + COL_GAP), panel_w, bid)
+        raise Unsatisfiable(
+            "x",
+            [
+                f"{tag} panel has {_r2(panel_w - 2 * PANEL_PAD)}px of content width",
+                f"{tag} number badge at {blk.size}px type is {badge}px wide plus a {COL_GAP}px gap",
+                f"{tag} that leaves {avail}px for the step text, which must be greater than 0. "
+                f"Reduce the step font size or widen the canvas.",
+            ],
+        )
 
     b.box(bid, DOC_PAD, panel_w, f"{bid}:top", PANEL_PAD, PANEL_PAD, "panel")
     ys.exactly(top, f"{bid}:top", 0.0, f"{tag} panel top is the block top")
