@@ -388,6 +388,22 @@ scroll inside their own container rather than being rescaled.
 digests, and the same total digest under three different `PYTHONHASHSEED` values in separate
 processes.
 
+## Running the verify
+
+```bash
+bash scripts/verify.sh
+```
+
+Every measurement runs with no dependencies except step 6, which measures the rendered page in a
+real browser. That step FAILS rather than skipping when `playwright-core` is not reachable,
+because a check that did not run reports the same success as one that ran and passed.
+
+```bash
+npm install --no-save playwright-core && npx playwright install chromium
+# or point at an existing install
+PLAYWRIGHT_CORE=/path/to/playwright-core bash scripts/verify.sh
+```
+
 ## Limitations
 
 **Fonts.** Four are supported, and nothing else: `DejaVu Sans`, `DejaVu Sans Bold`,

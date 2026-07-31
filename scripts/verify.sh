@@ -71,8 +71,39 @@ echo
 
 echo "=== 6. real browser measurement ==="
 command -v node >/dev/null || { echo "FAIL: node is required and was not found"; exit 1; }
-PWCORE="${PLAYWRIGHT_CORE:-$ROOT/../a11y-sweep/node_modules/playwright-core}"
-test -d "$PWCORE" || { echo "FAIL: playwright-core not found at ${PWCORE/#$HOME/\~}"; exit 1; }
+# Looked for in the ordinary places first. A hardcoded path to a SIBLING project works only in
+# the directory it was written in: a fresh clone anywhere else failed here, which is exactly the
+# kind of thing that makes a repo unreproducible for everyone except its author.
+find_playwright() {
+  if [ -n "${PLAYWRIGHT_CORE:-}" ] && [ -d "$PLAYWRIGHT_CORE" ]; then
+    printf '%s' "$PLAYWRIGHT_CORE"; return 0
+  fi
+  for c in "$ROOT/node_modules/playwright-core" \
+           "$ROOT/node_modules/playwright" \
+           "$ROOT/../a11y-sweep/node_modules/playwright-core"; do
+    [ -d "$c" ] && { printf '%s' "$c"; return 0; }
+  done
+  node -e "process.stdout.write(require.resolve('playwright-core').replace(/\/index\.js$/,''))" 2>/dev/null && return 0
+  return 1
+}
+PWCORE="$(find_playwright || true)"
+if [ -z "$PWCORE" ] || [ ! -d "$PWCORE" ]; then
+  # Failing rather than skipping is deliberate: a check that did not run reports the same success
+  # as one that ran and passed. The message has to be actionable or it only teaches people to
+  # ignore it. Claims 1 and 2 are also measured without a browser above; this step is the
+  # independent confirmation from the renderer that actually decides how wide text is.
+  cat >&2 <<'MSG'
+FAIL: playwright-core not found, so the page was NOT measured in a real browser.
+This is reported as a failure rather than skipped, because a check that did not run is
+"could not verify", never "verified".
+
+To run it:  npm install --no-save playwright-core && npx playwright install chromium
+Or point at an existing install:  PLAYWRIGHT_CORE=/path/to/playwright-core
+
+Every other step, including the overflow and collision measurements, runs without a browser.
+MSG
+  exit 1
+fi
 PLAYWRIGHT_CORE="$PWCORE" node tools/browser_check.js
 echo
 

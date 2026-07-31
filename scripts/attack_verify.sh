@@ -16,7 +16,22 @@ set -uo pipefail
 
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
-PWCORE="${PLAYWRIGHT_CORE:-$ROOT/../a11y-sweep/node_modules/playwright-core}"
+# Looked for in the ordinary places first. A hardcoded path to a SIBLING project works only in
+# the directory it was written in: a fresh clone anywhere else failed here, which is exactly the
+# kind of thing that makes a repo unreproducible for everyone except its author.
+find_playwright() {
+  if [ -n "${PLAYWRIGHT_CORE:-}" ] && [ -d "$PLAYWRIGHT_CORE" ]; then
+    printf '%s' "$PLAYWRIGHT_CORE"; return 0
+  fi
+  for c in "$ROOT/node_modules/playwright-core" \
+           "$ROOT/node_modules/playwright" \
+           "$ROOT/../a11y-sweep/node_modules/playwright-core"; do
+    [ -d "$c" ] && { printf '%s' "$c"; return 0; }
+  done
+  node -e "process.stdout.write(require.resolve('playwright-core').replace(/\/index\.js$/,''))" 2>/dev/null && return 0
+  return 1
+}
+PWCORE="$(find_playwright || true)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
