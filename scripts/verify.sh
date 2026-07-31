@@ -54,7 +54,7 @@ python3 tools/measure.py
 echo
 
 echo "=== 5. build the page ==="
-python3 tools/build_docs.py | grep -v '^ ' | head -n 4
+python3 tools/build_docs.py | grep '^wrote'
 DOCS="$ROOT/docs/index.html"
 test -s "$DOCS"
 echo "page: ${DOCS/#$HOME/\~} ($(wc -c < "$DOCS") bytes)"
