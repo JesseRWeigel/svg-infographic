@@ -494,3 +494,22 @@ docs/index.html    self-contained page, no remote assets
 MIT, see [LICENSE](LICENSE). The fonts are not part of this repository; the page embeds subset
 copies of DejaVu Sans (Bitstream Vera and Arev licences, both permissive) and Droid Sans Fallback
 (Apache 2.0).
+
+## The page is now a pure function of its committed inputs
+
+`docs/index.html` used to change on every build even when nothing changed. fontTools' WOFF2
+subsetting is not reproducible: given a byte-identical character set, three consecutive builds
+produced subsets of 5096, 5096 and 5088 bytes with three different digests. Pinning
+`PYTHONHASHSEED` stabilised the length but not the bytes, so at least two sources of variation are
+involved.
+
+This never touched the engine's own determinism, which is measured separately and holds (100
+renders of one spec, a single digest, byte-identical across processes). It only affected the
+compressed font blob. But it rewrote four `@font-face` lines on every build, so any verify run left
+the repository dirty and the committed page was an arbitrary pick among equally valid outputs.
+
+Font subsets are now build **inputs**, committed under `assets/fonts/`, with a hash of the exact
+character set in each filename. Changing the corpus text regenerates them automatically, and a
+stale subset can never be silently reused for text it does not cover. `verify.sh` builds the page
+twice and requires the two to be byte-identical; disabling the cache makes that check fail at byte
+489, which is how it was confirmed to be live rather than decorative.

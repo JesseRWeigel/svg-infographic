@@ -14,6 +14,7 @@ Out:  examples/*.svg  and  docs/index.html
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import os
@@ -62,6 +63,46 @@ def corpus_chars() -> dict[str, set[str]]:
             key = f"{t.family}|{t.weight}"
             used.setdefault(key, set()).update(t.content)
     return used
+
+
+# Where committed font subsets live. They are build INPUTS, not build outputs, and the reason is
+# that fontTools' WOFF2 subsetting is not reproducible. With a byte-identical character set, three
+# consecutive builds produced subsets of 5096, 5096 and 5088 bytes with three different digests.
+# Pinning PYTHONHASHSEED stabilises the length but not the bytes, so at least two separate sources
+# of variation are involved.
+#
+# The engine's own determinism is real and is measured elsewhere in verify (100 renders of the
+# same spec, one digest). This only ever affected the compressed font blob. But rebuilding the
+# page rewrote four @font-face lines every single time, which left the repository dirty after any
+# build and made the committed docs/index.html an arbitrary pick among equally valid outputs.
+#
+# So a subset is generated once, committed, and reused. The filename carries a hash of the exact
+# character set it was built for, so changing the corpus text regenerates it automatically and a
+# stale subset can never be silently reused for text it does not cover.
+FONT_CACHE = ROOT / "assets" / "fonts"
+
+
+def _charset_key(path: Path, chars: set[str]) -> str:
+    payload = path.name + "\u0000" + "".join(sorted(chars))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def cached_subset(path: Path, chars: set[str], *, regenerate: bool = False) -> bytes:
+    """The committed subset for this exact character set, building it once if absent."""
+    key = _charset_key(path, chars)
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", path.stem).strip("-").lower()
+    target = FONT_CACHE / f"{slug}-{key}.woff2"
+    if target.exists() and not regenerate:
+        return target.read_bytes()
+    data = woff2_subset(path, chars)
+    FONT_CACHE.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    # Drop subsets of this font built for a character set that is no longer used, so the cache
+    # cannot grow without bound and a reader can tell which files are live.
+    for stale in FONT_CACHE.glob(f"{slug}-*.woff2"):
+        if stale != target:
+            stale.unlink()
+    return data
 
 
 def woff2_subset(path: Path, chars: set[str]) -> bytes:
@@ -829,11 +870,12 @@ def main() -> int:
         if family == "DejaVu Sans":
             chars = chars | set(LAB_CHARS)
         path = _path_for(family, weight)
-        fonts[(family, weight)] = woff2_subset(path, chars)
+        fonts[(family, weight)] = cached_subset(path, chars)
     # The page's own body copy and code blocks use these two.
     for family, weight in (("DejaVu Sans", "400"), ("DejaVu Sans", "700"), ("DejaVu Sans Mono", "400")):
         if (family, weight) not in fonts:
-            fonts[(family, weight)] = woff2_subset(_path_for(family, weight), set(LAB_CHARS))
+            fonts[(family, weight)] = cached_subset(_path_for(family, weight),
+                                                    set(LAB_CHARS))
 
     report = build_report()
     html = build_html(report, fonts, svgs)

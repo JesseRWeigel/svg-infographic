@@ -57,6 +57,24 @@ echo "=== 5. build the page ==="
 python3 tools/build_docs.py | grep '^wrote'
 DOCS="$ROOT/docs/index.html"
 test -s "$DOCS"
+
+# The page must come out the same twice in a row. It did not used to. fontTools' WOFF2 subsetting
+# is not reproducible, so with a byte-identical character set three builds gave three different
+# blobs (5096, 5096, 5088 bytes), which rewrote four @font-face lines on every build and left the
+# repository dirty after any verify run. The subsets are now committed under assets/fonts/ and
+# keyed by a hash of the exact character set they cover, so the page is a pure function of them.
+# This check is what stops that regressing, and it is deliberately a full byte comparison.
+cp "$DOCS" "$ROOT/.docs-first-build"
+python3 tools/build_docs.py >/dev/null
+if cmp -s "$DOCS" "$ROOT/.docs-first-build"; then
+  echo "determinism: two consecutive builds are byte-identical ($(wc -c < "$DOCS") bytes)"
+  rm -f "$ROOT/.docs-first-build"
+else
+  echo "FAIL: two consecutive builds of docs/index.html differ"
+  cmp "$DOCS" "$ROOT/.docs-first-build" | head -3
+  rm -f "$ROOT/.docs-first-build"
+  exit 1
+fi
 echo "page: ${DOCS/#$HOME/\~} ($(wc -c < "$DOCS") bytes)"
 grep -q 'data-engine="svg-infographic"' "$DOCS"
 grep -q 'prefers-color-scheme: dark' "$DOCS"
