@@ -211,7 +211,7 @@ below can be read as exact rather than as within-tolerance.
 
 ```
 svg-infographic verify
-project: ~/Projects/thousand/projects/svg-infographic
+project: <repo>/svg-infographic
 
 === 1. python: what is available ===
 Python 3.12.3
@@ -279,7 +279,7 @@ CLAIM 2  minimum label separation  +1.0000 px  (c09-tiny-canvas t2(para) vs t3(p
 === 5. build the page ===
 wrote 35 svg files to examples/
 wrote docs/index.html, 446 KiB, fonts 63 KiB
-page: ~/Projects/thousand/projects/svg-infographic/docs/index.html (457343 bytes)
+page: <repo>/svg-infographic/docs/index.html (457343 bytes)
 page self-check: engine marker, both theme mechanisms, no remote assets
 
 === 6. real browser measurement ===
@@ -363,7 +363,7 @@ byte-identical across processes
 scanned files under svg-infographic/, findings: 0
 
 === VERIFIED ===
-All claims measured and holding. Page: ~/Projects/thousand/projects/svg-infographic/docs/index.html
+All claims measured and holding. Page: <repo>/svg-infographic/docs/index.html
 ```
 
 ### Reading those numbers
