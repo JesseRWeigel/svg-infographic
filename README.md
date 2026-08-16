@@ -3,6 +3,8 @@
 A layout engine where the model produces a typed data spec and a constraint solver produces the
 geometry. Three properties are guaranteed and measured rather than hoped for:
 
+**[Real output, measured in this browser →](https://jesserweigel.github.io/svg-infographic/)**
+
 1. **Text never overflows its container.**
 2. **Labels never collide with each other.**
 3. **The same spec always renders identically, byte for byte.**
